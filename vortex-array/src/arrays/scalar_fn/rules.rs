@@ -86,7 +86,12 @@ impl ArrayReduceRule<ScalarFn> for IsNullReduceRule {
             Validity::AllInvalid => ConstantArray::new(is_null, view.len()).into_array(),
             Validity::Array(array) => {
                 if is_null {
+<<<<<<< HEAD
                     array.not()?
+||||||| parent of 63300294f (reduce is_null(array) to array's validity)
+=======
+                    array.apply(&not(root()))?
+>>>>>>> 63300294f (reduce is_null(array) to array's validity)
                 } else {
                     array
                 }
@@ -203,6 +208,7 @@ mod tests {
     use crate::expr::cast;
     use crate::expr::is_not_null;
     use crate::expr::is_null;
+    use crate::expr::not;
     use crate::expr::root;
     use crate::optimizer::rules::ArrayParentReduceRule;
     use crate::scalar::Scalar;
@@ -332,8 +338,22 @@ mod tests {
         let buffer = buffer![1, 2, 3];
         let nullable = PrimitiveArray::new(buffer, Validity::Array(validity.clone())).into_array();
 
+<<<<<<< HEAD
         assert_arrays_eq!(nullable.clone().apply(&is_not_null(root()))?, validity, ctx);
         assert_arrays_eq!(nullable.apply(&is_null(root()))?, validity.not()?, ctx);
+||||||| parent of 63300294f (reduce is_null(array) to array's validity)
+=======
+        assert_arrays_eq!(
+            nullable.clone().apply(&is_not_null(root()))?,
+            validity.clone(),
+            ctx
+        );
+        assert_arrays_eq!(
+            nullable.apply(&is_null(root()))?,
+            validity.apply(&not(root()))?,
+            ctx
+        );
+>>>>>>> 63300294f (reduce is_null(array) to array's validity)
 
         Ok(())
     }
