@@ -3,6 +3,7 @@
 
 //! The 16-byte view struct stored in variable-length binary vectors.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -21,8 +22,10 @@ use vortex_error::VortexExpect;
 ///
 /// Every view stores the value's length and its zero-padded first four bytes, so most comparisons
 /// are answered from the view without reading the value. [`head`](Self::head) rules equality out;
-/// [`order_prefix`](Self::order_prefix) and [`order_tail`](Self::order_tail) order values. Each
-/// has an `_of` constructor for a value not held in a view.
+/// [`order_prefix`](Self::order_prefix) and [`order_tail`](Self::order_tail) order values.
+/// [`value_eq`](Self::value_eq) and [`value_cmp`](Self::value_cmp) read the values only when those
+/// words tie. A value held outside any array compares as its
+/// [`make_view(value, 0, 0)`](Self::make_view), with the value itself as the only buffer.
 ///
 /// Zero padding keeps the ordering exact: a lower word means the values differ at a byte both
 /// have, or the shorter is a proper prefix of the longer — and either way it orders first.
@@ -299,37 +302,45 @@ impl BinaryView {
         ((self.as_u128() >> 64) as u64).swap_bytes()
     }
 
-    /// The [`prefix`](Self::prefix) a view holding `value` would carry.
+    /// Whether this view's value equals `other`'s. The values are read out of `buffers` and
+    /// `other_buffers` only when the heads match and the values are too long to inline.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a value that has to be read is not covered by its buffers.
     #[inline]
-    pub fn prefix_of(value: &[u8]) -> [u8; 4] {
-        let mut prefix = [0u8; 4];
-        let len = value.len().min(prefix.len());
-        prefix[..len].copy_from_slice(&value[..len]);
-        prefix
+    pub fn value_eq(&self, buffers: &[&[u8]], other: &Self, other_buffers: &[&[u8]]) -> bool {
+        if self.head() != other.head() {
+            return false;
+        }
+        if self.is_inlined() {
+            // Equal heads mean equal lengths, so both values live entirely in their views.
+            return self.as_u128() == other.as_u128();
+        }
+        self.bytes(buffers)[4..] == other.bytes(other_buffers)[4..]
     }
 
-    /// The [`head`](Self::head) a view holding `value` would carry; lengths over `u32::MAX`
-    /// saturate.
+    /// Orders this view's value against `other`'s. The values are read out of `buffers` and
+    /// `other_buffers` only when the order prefixes tie and a value is too long to inline.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a value that has to be read is not covered by its buffers.
     #[inline]
-    pub fn head_of(value: &[u8]) -> u64 {
-        let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-        u64::from(len) | (u64::from(u32::from_le_bytes(Self::prefix_of(value))) << 32)
-    }
-
-    /// The [`order_prefix`](Self::order_prefix) a view holding `value` would carry.
-    #[inline]
-    pub fn order_prefix_of(value: &[u8]) -> u32 {
-        u32::from_be_bytes(Self::prefix_of(value))
-    }
-
-    /// The [`order_tail`](Self::order_tail) an inlined view holding `value` would carry.
-    #[inline]
-    pub fn order_tail_of(value: &[u8]) -> u64 {
-        let mut tail = [0u8; 8];
-        let value = value.get(4..).unwrap_or_default();
-        let len = value.len().min(tail.len());
-        tail[..len].copy_from_slice(&value[..len]);
-        u64::from_be_bytes(tail)
+    pub fn value_cmp(&self, buffers: &[&[u8]], other: &Self, other_buffers: &[&[u8]]) -> Ordering {
+        let (prefix, other_prefix) = (self.order_prefix(), other.order_prefix());
+        if prefix != other_prefix {
+            return prefix.cmp(&other_prefix);
+        }
+        if self.is_inlined() && other.is_inlined() {
+            let (tail, other_tail) = (self.order_tail(), other.order_tail());
+            if tail != other_tail {
+                return tail.cmp(&other_tail);
+            }
+            // Tied zero-padded words mean the shorter value is a prefix of the longer.
+            return self.len().cmp(&other.len());
+        }
+        self.bytes(buffers).cmp(other.bytes(other_buffers))
     }
 
     /// Returns the binary view as u128 representation.

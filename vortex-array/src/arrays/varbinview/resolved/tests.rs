@@ -27,23 +27,14 @@ const SHORT: &[u8] = b"short";
 /// The rows of [`two_buffer_array`], in order.
 const TWO_BUFFER_VALUES: [&[u8]; 4] = [ALPHA, SHORT, GAMMA, BETA];
 
-fn ref_view(value: &[u8], buffer_index: u32, offset: u32) -> VortexResult<BinaryView> {
-    Ok(BinaryView::new_ref(
-        u32::try_from(value.len())?,
-        BinaryView::prefix_of(value),
-        buffer_index,
-        offset,
-    ))
-}
-
 /// Values over two data buffers, one at a non-zero offset, interleaved with an inlined value.
 fn two_buffer_array() -> VortexResult<VarBinViewArray> {
     let mut ctx = array_session().create_execution_ctx();
     let views = Buffer::from_iter([
-        ref_view(ALPHA, 0, 0)?,
-        BinaryView::new_inlined(SHORT),
-        ref_view(GAMMA, 1, 0)?,
-        ref_view(BETA, 0, u32::try_from(ALPHA.len())?)?,
+        BinaryView::make_view(ALPHA, 0, 0),
+        BinaryView::make_view(SHORT, 0, 0),
+        BinaryView::make_view(GAMMA, 1, 0),
+        BinaryView::make_view(BETA, 0, u32::try_from(ALPHA.len())?),
     ]);
     VarBinViewArray::try_new(
         views,

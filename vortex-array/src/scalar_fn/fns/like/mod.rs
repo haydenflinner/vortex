@@ -303,13 +303,14 @@ fn eval_pattern(
         LikePattern::Eq(needle) => {
             // Compare the view head (length plus 4-byte prefix) first; only views that agree
             // on both dereference their data buffer for the remaining bytes.
-            let needle_head = BinaryView::head_of(needle);
+            let needle_view = BinaryView::make_view(needle, 0, 0);
+            let needle_buffers = [needle.as_slice()];
+            let buffers = haystack.buffers();
             BitBuffer::collect_bool_in(
                 len,
                 |i| {
-                    let view = &haystack.views()[i];
                     let matched =
-                        view.head() == needle_head && haystack.bytes(i)[4..] == needle[4..];
+                        haystack.views()[i].value_eq(buffers, &needle_view, &needle_buffers);
                     matched != negated
                 },
                 allocator.clone(),
@@ -322,7 +323,7 @@ fn eval_pattern(
             let needle_len = needle.len();
             let prefix_len = needle_len.min(4);
             // Raw prefix bytes, unswapped: this is a masked equality, not an ordering.
-            let needle_prefix = u32::from_le_bytes(BinaryView::prefix_of(needle));
+            let needle_prefix = u32::from_le_bytes(BinaryView::make_view(needle, 0, 0).prefix());
             let prefix_mask = if prefix_len == 4 {
                 u32::MAX
             } else {

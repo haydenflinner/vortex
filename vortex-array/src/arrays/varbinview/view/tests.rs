@@ -28,7 +28,7 @@ fn new_ref_matches_make_view(#[case] len: u32, #[case] buffer_index: u32, #[case
     assert_eq!(r.offset, offset);
 }
 
-/// Byte strings over `{\x00, a, b}` up to `max_len`; `\x00` collides with zero padding.
+/// Byte strings over `{\x00, a, \xff}` up to `max_len`; `\x00` collides with zero padding.
 fn values(max_len: usize) -> Vec<Vec<u8>> {
     let mut values = vec![Vec::new()];
     let mut frontier = vec![Vec::new()];
@@ -48,42 +48,36 @@ fn values(max_len: usize) -> Vec<Vec<u8>> {
     values
 }
 
+/// [`values`] up to three bytes, plus copies padded with `\x00` or `\xff` to end inside the
+/// prefix, inside the inlined tail, or past the inline limit.
+fn padded_values() -> Vec<Vec<u8>> {
+    let short = values(3);
+    let mut padded = short.clone();
+    for value in &short {
+        for pad in [b'\x00', b'\xff'] {
+            for extra in [2, 9, 13] {
+                let mut value = value.clone();
+                value.resize(value.len() + extra, pad);
+                padded.push(value);
+            }
+        }
+    }
+    padded
+}
+
 /// A view holding `value`, inlined when it fits and otherwise referencing buffer 0 at offset 0.
 fn view_of(value: &[u8]) -> BinaryView {
     BinaryView::make_view(value, 0, 0)
-}
-
-#[test]
-fn words_match_between_view_and_value() {
-    for value in values(5).iter().chain(&[vec![b'z'; 40]]) {
-        let view = view_of(value);
-        assert_eq!(view.prefix(), BinaryView::prefix_of(value), "{value:?}");
-        assert_eq!(view.head(), BinaryView::head_of(value), "{value:?}");
-        assert_eq!(
-            view.order_prefix(),
-            BinaryView::order_prefix_of(value),
-            "{value:?}"
-        );
-        if view.is_inlined() {
-            assert_eq!(
-                view.order_tail(),
-                BinaryView::order_tail_of(value),
-                "{value:?}"
-            );
-        }
-    }
 }
 
 /// A lower order prefix proves a lower value; an equal one decides nothing.
 #[test]
 fn order_prefix_refines_value_order() {
     let values = values(6);
-    for a in &values {
-        for b in &values {
-            let (a_prefix, b_prefix) = (
-                BinaryView::order_prefix_of(a),
-                BinaryView::order_prefix_of(b),
-            );
+    let views = values.iter().map(|value| view_of(value)).collect::<Vec<_>>();
+    for (a, a_view) in values.iter().zip(&views) {
+        for (b, b_view) in values.iter().zip(&views) {
+            let (a_prefix, b_prefix) = (a_view.order_prefix(), b_view.order_prefix());
             if a_prefix < b_prefix {
                 assert!(a < b, "prefix ordered {a:?} below {b:?}");
             }
@@ -94,23 +88,24 @@ fn order_prefix_refines_value_order() {
     }
 }
 
-/// Inlined values are fully ordered by order prefix, then order tail, then length.
+/// The value comparisons agree with byte order whether each side is inlined or buffer-backed.
 #[test]
-fn order_words_fully_order_inlined_values() {
-    let values = values(4)
-        .into_iter()
-        .filter(|value| value.len() <= BinaryView::MAX_INLINED_SIZE)
-        .collect::<Vec<_>>();
+fn value_comparisons_match_byte_order() {
+    let values = padded_values();
     for a in &values {
-        let a_view = view_of(a);
+        let (a_view, a_buffers) = (view_of(a), [a.as_slice()]);
         for b in &values {
-            let b_view = view_of(b);
-            let by_words = (a_view.order_prefix(), a_view.order_tail(), a_view.len()).cmp(&(
-                b_view.order_prefix(),
-                b_view.order_tail(),
-                b_view.len(),
-            ));
-            assert_eq!(by_words, a.cmp(b), "words misordered {a:?} against {b:?}");
+            let (b_view, b_buffers) = (view_of(b), [b.as_slice()]);
+            assert_eq!(
+                a_view.value_cmp(&a_buffers, &b_view, &b_buffers),
+                a.cmp(b),
+                "{a:?} against {b:?}"
+            );
+            assert_eq!(
+                a_view.value_eq(&a_buffers, &b_view, &b_buffers),
+                a == b,
+                "{a:?} against {b:?}"
+            );
         }
     }
 }
@@ -119,11 +114,12 @@ fn order_words_fully_order_inlined_values() {
 #[test]
 fn head_rules_out_inequality() {
     let values = values(6);
-    for a in &values {
-        for b in &values {
+    let views = values.iter().map(|value| view_of(value)).collect::<Vec<_>>();
+    for (a, a_view) in values.iter().zip(&views) {
+        for (b, b_view) in values.iter().zip(&views) {
             if a == b {
-                assert_eq!(BinaryView::head_of(a), BinaryView::head_of(b));
-            } else if BinaryView::head_of(a) == BinaryView::head_of(b) {
+                assert_eq!(a_view.head(), b_view.head());
+            } else if a_view.head() == b_view.head() {
                 assert_eq!(a.len(), b.len(), "head collided across lengths");
                 assert_eq!(a[..4.min(a.len())], b[..4.min(b.len())]);
             }

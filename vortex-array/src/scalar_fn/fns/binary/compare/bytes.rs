@@ -6,9 +6,8 @@
 //! Equality first compares the leading 8 bytes of each view (length plus 4-byte prefix), which
 //! answers most lanes without touching the data buffers. Ordering compares the inline 4-byte
 //! prefixes first and only dereferences the full value on a prefix tie. UTF-8 values compare by
-//! their byte representation, which matches code-point order.
-
-use std::cmp::Ordering;
+//! their byte representation, which matches code-point order. A constant operand compares as a
+//! view of the constant.
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BufferAllocatorRef;
@@ -81,52 +80,6 @@ fn constant_bytes(scalar: &Scalar) -> VortexResult<Vec<u8>> {
     value.ok_or_else(|| vortex_err!("null constant handled by execute_compare"))
 }
 
-/// Compare `lhs_view` from `lhs` against `rhs_view` from `rhs` for equality.
-#[inline]
-fn view_eq(
-    lhs: &ResolvedViews<'_>,
-    lhs_view: &BinaryView,
-    rhs: &ResolvedViews<'_>,
-    rhs_view: &BinaryView,
-) -> bool {
-    if lhs_view.head() != rhs_view.head() {
-        return false;
-    }
-    if lhs_view.is_inlined() {
-        // Lengths are equal and at most 12: the whole value lives in the view.
-        return lhs_view.as_u128() == rhs_view.as_u128();
-    }
-    // Equal lengths above 12 and equal prefixes: compare the out-of-line suffixes.
-    lhs.view_bytes(lhs_view)[4..] == rhs.view_bytes(rhs_view)[4..]
-}
-
-/// Compare `lhs_view` from `lhs` against `rhs_view` from `rhs`.
-#[inline]
-fn view_cmp(
-    lhs: &ResolvedViews<'_>,
-    lhs_view: &BinaryView,
-    rhs: &ResolvedViews<'_>,
-    rhs_view: &BinaryView,
-) -> Ordering {
-    let lhs_prefix = lhs_view.order_prefix();
-    let rhs_prefix = rhs_view.order_prefix();
-    if lhs_prefix != rhs_prefix {
-        return lhs_prefix.cmp(&rhs_prefix);
-    }
-    if lhs_view.is_inlined() && rhs_view.is_inlined() {
-        // Both values live entirely in their views: compare the remaining 8 (zero-padded)
-        // value bytes, then lengths. A tie on padded windows means the shorter value is a
-        // prefix of the longer one.
-        let lhs_tail = lhs_view.order_tail();
-        let rhs_tail = rhs_view.order_tail();
-        if lhs_tail != rhs_tail {
-            return lhs_tail.cmp(&rhs_tail);
-        }
-        return lhs_view.len().cmp(&rhs_view.len());
-    }
-    lhs.view_bytes(lhs_view).cmp(rhs.view_bytes(rhs_view))
-}
-
 /// Compare two UTF-8 or binary arrays.
 pub(super) fn compare_bytes(
     lhs: &ArrayRef,
@@ -184,48 +137,16 @@ fn compare_views(
     // The unchecked view accesses below index both sides with `i < len`, so this must hold even
     // in release builds.
     assert_eq!(len, rhs.len(), "compared views must have equal lengths");
-    // Dispatch the operator outside the lane loop so each predicate inlines into its own loop;
-    // a shared `fn(Ordering) -> bool` pointer would cost an indirect call per lane.
-    match op {
-        CompareOperator::Eq => BitBuffer::collect_bool_in(
-            len,
-            |i| {
-                // SAFETY: `collect_bool` yields i < len == views.len() for both sides.
-                unsafe { view_eq(lhs, lhs.view_unchecked(i), rhs, rhs.view_unchecked(i)) }
-            },
-            allocator.clone(),
-        ),
-        CompareOperator::NotEq => BitBuffer::collect_bool_in(
-            len,
-            |i| {
-                // SAFETY: `collect_bool` yields i < len == views.len() for both sides.
-                unsafe { !view_eq(lhs, lhs.view_unchecked(i), rhs, rhs.view_unchecked(i)) }
-            },
-            allocator.clone(),
-        ),
-        CompareOperator::Gt => collect_ordering_bits(lhs, rhs, Ordering::is_gt, allocator),
-        CompareOperator::Gte => collect_ordering_bits(lhs, rhs, Ordering::is_ge, allocator),
-        CompareOperator::Lt => collect_ordering_bits(lhs, rhs, Ordering::is_lt, allocator),
-        CompareOperator::Lte => collect_ordering_bits(lhs, rhs, Ordering::is_le, allocator),
-    }
-}
-
-/// Bit-pack `predicate(view_cmp(lhs[i], rhs[i]))` over two equal-length view sides.
-fn collect_ordering_bits(
-    lhs: &ResolvedViews<'_>,
-    rhs: &ResolvedViews<'_>,
-    predicate: impl Fn(Ordering) -> bool,
-    allocator: &BufferAllocatorRef,
-) -> BitBuffer {
-    let len = lhs.len();
-    assert_eq!(len, rhs.len(), "compared views must have equal lengths");
-    BitBuffer::collect_bool_in(
+    collect_compare_bits(
         len,
-        |i| {
-            // SAFETY: `collect_bool` yields i < len == views.len() for both sides.
-            predicate(unsafe { view_cmp(lhs, lhs.view_unchecked(i), rhs, rhs.view_unchecked(i)) })
-        },
-        allocator.clone(),
+        // SAFETY: `collect_compare_bits` only asks for lanes below `len`, the length of both sides.
+        |i| unsafe { lhs.view_unchecked(i) },
+        lhs.buffers(),
+        // SAFETY: as above.
+        |i| unsafe { rhs.view_unchecked(i) },
+        rhs.buffers(),
+        op,
+        allocator,
     )
 }
 
@@ -235,143 +156,42 @@ fn compare_views_constant(
     op: CompareOperator,
     allocator: &BufferAllocatorRef,
 ) -> BitBuffer {
-    let len = lhs.len();
-    // The same head/prefix/tail words a view stores, precomputed once for the constant.
-    let constant_head = BinaryView::head_of(constant);
-    let constant_prefix = BinaryView::order_prefix_of(constant);
-    let constant_tail = BinaryView::order_tail_of(constant);
-    // The full 16-byte word an inlined view holding `constant` would carry; only meaningful when
-    // the constant is short enough to inline, and only reached in that case (a longer constant
-    // never head-matches an inlined view).
-    let constant_inlined = if constant.len() <= BinaryView::MAX_INLINED_SIZE {
-        BinaryView::new_inlined(constant).as_u128()
-    } else {
-        0
-    };
-
-    match op {
-        CompareOperator::Eq => BitBuffer::collect_bool_in(
-            len,
-            |i| {
-                // SAFETY: `collect_bool` yields i < len == views.len().
-                let view = unsafe { lhs.view_unchecked(i) };
-                constant_eq(lhs, view, constant, constant_head, constant_inlined)
-            },
-            allocator.clone(),
-        ),
-        CompareOperator::NotEq => BitBuffer::collect_bool_in(
-            len,
-            |i| {
-                // SAFETY: `collect_bool` yields i < len == views.len().
-                let view = unsafe { lhs.view_unchecked(i) };
-                !constant_eq(lhs, view, constant, constant_head, constant_inlined)
-            },
-            allocator.clone(),
-        ),
-        CompareOperator::Gt => collect_constant_ordering_bits(
-            lhs,
-            constant,
-            constant_prefix,
-            constant_tail,
-            Ordering::is_gt,
-            allocator,
-        ),
-        CompareOperator::Gte => collect_constant_ordering_bits(
-            lhs,
-            constant,
-            constant_prefix,
-            constant_tail,
-            Ordering::is_ge,
-            allocator,
-        ),
-        CompareOperator::Lt => collect_constant_ordering_bits(
-            lhs,
-            constant,
-            constant_prefix,
-            constant_tail,
-            Ordering::is_lt,
-            allocator,
-        ),
-        CompareOperator::Lte => collect_constant_ordering_bits(
-            lhs,
-            constant,
-            constant_prefix,
-            constant_tail,
-            Ordering::is_le,
-            allocator,
-        ),
-    }
-}
-
-/// Bit-pack `predicate(constant_cmp(lhs[i], constant))` over one view side.
-fn collect_constant_ordering_bits(
-    lhs: &ResolvedViews<'_>,
-    constant: &[u8],
-    constant_prefix: u32,
-    constant_tail: u64,
-    predicate: impl Fn(Ordering) -> bool,
-    allocator: &BufferAllocatorRef,
-) -> BitBuffer {
-    BitBuffer::collect_bool_in(
+    // The constant as a view whose only buffer is the constant itself.
+    let constant_view = BinaryView::make_view(constant, 0, 0);
+    collect_compare_bits(
         lhs.len(),
-        |i| {
-            // SAFETY: `collect_bool` yields i < len == views.len().
-            let view = unsafe { lhs.view_unchecked(i) };
-            predicate(constant_cmp(
-                lhs,
-                view,
-                constant,
-                constant_prefix,
-                constant_tail,
-            ))
-        },
-        allocator.clone(),
+        // SAFETY: `collect_compare_bits` only asks for lanes below `lhs.len()`.
+        |i| unsafe { lhs.view_unchecked(i) },
+        lhs.buffers(),
+        |_| &constant_view,
+        &[constant],
+        op,
+        allocator,
     )
 }
 
-/// Compare a view against a constant for equality using the constant's precomputed head and
-/// inline words.
-#[inline]
-fn constant_eq(
-    side: &ResolvedViews<'_>,
-    view: &BinaryView,
-    constant: &[u8],
-    constant_head: u64,
-    constant_inlined: u128,
-) -> bool {
-    if view.head() != constant_head {
-        return false;
+/// Bit-pack `op` over `len` lanes, lane `i` comparing `lhs(i)` against `rhs(i)`.
+///
+/// The operator is dispatched outside the lane loop so each predicate inlines into its own loop;
+/// a shared `fn(Ordering) -> bool` pointer would cost an indirect call per lane.
+fn collect_compare_bits<'a>(
+    len: usize,
+    lhs: impl Fn(usize) -> &'a BinaryView,
+    lhs_buffers: &[&[u8]],
+    rhs: impl Fn(usize) -> &'a BinaryView,
+    rhs_buffers: &[&[u8]],
+    op: CompareOperator,
+    allocator: &BufferAllocatorRef,
+) -> BitBuffer {
+    let eq = |i| lhs(i).value_eq(lhs_buffers, rhs(i), rhs_buffers);
+    let cmp = |i| lhs(i).value_cmp(lhs_buffers, rhs(i), rhs_buffers);
+    let allocator = allocator.clone();
+    match op {
+        CompareOperator::Eq => BitBuffer::collect_bool_in(len, eq, allocator),
+        CompareOperator::NotEq => BitBuffer::collect_bool_in(len, |i| !eq(i), allocator),
+        CompareOperator::Gt => BitBuffer::collect_bool_in(len, |i| cmp(i).is_gt(), allocator),
+        CompareOperator::Gte => BitBuffer::collect_bool_in(len, |i| cmp(i).is_ge(), allocator),
+        CompareOperator::Lt => BitBuffer::collect_bool_in(len, |i| cmp(i).is_lt(), allocator),
+        CompareOperator::Lte => BitBuffer::collect_bool_in(len, |i| cmp(i).is_le(), allocator),
     }
-    if view.is_inlined() {
-        // An equal head implies equal lengths, so the constant is also at most 12 bytes and
-        // `constant_inlined` holds its exact inlined representation.
-        return view.as_u128() == constant_inlined;
-    }
-    side.view_bytes(view)[4..] == constant[4..]
-}
-
-/// Compare a view against a constant using the constant's precomputed prefix and tail words.
-#[inline]
-fn constant_cmp(
-    side: &ResolvedViews<'_>,
-    view: &BinaryView,
-    constant: &[u8],
-    constant_prefix: u32,
-    constant_tail: u64,
-) -> Ordering {
-    let prefix = view.order_prefix();
-    if prefix != constant_prefix {
-        return prefix.cmp(&constant_prefix);
-    }
-    if view.is_inlined() {
-        // The view's whole value lives in its first 12 (zero-padded) bytes, and the constant's
-        // first 12 (zero-padded) bytes are precomputed: compare tails, then lengths. A padded
-        // tie means one value is a prefix of the other within the first 12 bytes.
-        let tail = view.order_tail();
-        if tail != constant_tail {
-            return tail.cmp(&constant_tail);
-        }
-        return (view.len() as usize).cmp(&constant.len());
-    }
-    side.view_bytes(view).cmp(constant)
 }
