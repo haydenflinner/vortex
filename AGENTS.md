@@ -33,7 +33,9 @@ documentation in `docs/`, and benchmark tooling in `vortex-bench/` and `benchmar
   types they describe (`vortex-array`, `vortex-layout`, `vortex-file`, `vortex-ipc`), and are
   compiled into `OUT_DIR` by that crate's `build.rs` via `vortex-build`. Generated code is never
   checked in, and a schema that includes another crate's declares that crate with `depends_on`.
-  Building therefore requires `flatc` on `PATH` (or `FLATC` set); `protoc` is not needed.
+  `flatc` comes from `PATH` (or `FLATC` set); when neither provides it, `vortex-build` falls back
+  to the `flatc-fork` crate, which compiles FlatBuffers' vendored source with CMake (a one-time
+  per-target-directory build). `protoc` is not needed.
 - `vortex-python` contains Python bindings. RST-flavored project docs live in `docs/`.
 
 ## Scoped Guidance

@@ -168,7 +168,18 @@ fn env_fragment(value: &str) -> String {
 
 fn flatc_binary() -> PathBuf {
     println!("cargo::rerun-if-env-changed=FLATC");
-    env::var_os("FLATC").map_or_else(|| PathBuf::from("flatc"), PathBuf::from)
+    if let Some(path) = env::var_os("FLATC") {
+        return PathBuf::from(path);
+    }
+    // A `flatc` on `PATH` wins over the vendored build so existing setups behave as before.
+    let exe = if cfg!(windows) { "flatc.exe" } else { "flatc" };
+    let on_path = env::var_os("PATH")
+        .is_some_and(|paths| env::split_paths(&paths).any(|dir| dir.join(exe).is_file()));
+    if on_path {
+        PathBuf::from("flatc")
+    } else {
+        flatc_fork::flatc().to_path_buf()
+    }
 }
 
 fn manifest_dir() -> PathBuf {
