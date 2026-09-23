@@ -25,16 +25,22 @@ use crate::scalar_fn::unstable::row::ViewLen;
 use crate::validity::Validity;
 
 /// Proof that every element in one uninitialized fixed-size row was initialized.
-///
-/// The private field prevents construction without calling [`fill`](Self::fill), which writes the
-/// complete row before returning.
 #[must_use = "return this token from the row closure to prove that it initialized the output"]
 pub struct InitializedRow(());
 
 impl InitializedRow {
     /// Fill every element in `row` and return its proof token.
+    ///
+    /// # Safety
+    ///
+    /// - `row` must be the entire [`FixedSizeListSink`] row supplied to the current callback,
+    ///   including when its width is zero.
+    /// - On success, that callback must return this token and preserve every element's
+    ///   initialization until it returns.
+    ///
+    /// Violating these requirements can cause undefined behavior.
     #[inline]
-    pub fn fill<T>(
+    pub unsafe fn fill<T>(
         row: &mut [MaybeUninit<T>],
         mut value_for_index: impl FnMut(usize) -> T,
     ) -> Self {
@@ -92,9 +98,9 @@ pub struct FixedSizeListSink<T> {
 
 // SAFETY: `with_capacity` reserves `row_count * width` elements, and `FixedSizeRows` retains that
 // shape for its lifetime. Each row is one disjoint `width`-element slice. `InitializedRow::fill`
-// writes every element before returning its private token, and `FixedSizeRows::fill_default`
-// writes every flat element before masked traversal. `values` retains length zero until every row
-// is safe to publish in `finish`.
+// requires the entire current row and preservation of its initialization until the callback
+// returns its private token. `FixedSizeRows::fill_default` writes every flat element before masked
+// traversal. `values` retains length zero until every row is safe to publish in `finish`.
 unsafe impl<T: OutputElement + Copy + Default> OutputSink for FixedSizeListSink<T> {
     type Params = usize;
     type Rows<'a> = FixedSizeRows<'a, T>;

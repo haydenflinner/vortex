@@ -37,9 +37,11 @@ impl InitializedElement {
     ///
     /// # Safety
     ///
-    /// `row` must be the [`UninitElementSink`] row supplied to the current callback. The caller
-    /// must return the token from that callback. Using another row or returning the token from
-    /// another callback can cause undefined behavior.
+    /// - `row` must be the [`UninitElementSink`] slot supplied to the current callback.
+    /// - On success, that callback must return this token and preserve the slot's initialization
+    ///   until it returns.
+    ///
+    /// Violating these requirements can cause undefined behavior.
     #[inline]
     pub unsafe fn write<T>(row: &mut MaybeUninit<T>, value: T) -> Self {
         row.write(value);
