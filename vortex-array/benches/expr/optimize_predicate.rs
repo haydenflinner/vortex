@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Benchmarks `Expression::optimize_recursive` on lookup-style pushdown predicates:
+//! Benchmarks binding and optimizing lookup-style pushdown predicates:
 //! an id membership test (either `list_contains` or a balanced OR of equalities) conjoined
 //! with timestamp range bounds and kind filters.
 
@@ -209,5 +209,5 @@ fn optimize_lookup_predicate(bencher: Bencher, predicate_case: &PredicateCase) {
     let scope = scope();
     let predicate = lookup_predicate(*predicate_case);
 
-    bencher.bench(|| black_box(predicate.optimize_recursive(&scope)));
+    bencher.bench(|| black_box(predicate.bind(&scope).and_then(|p| p.optimize_recursive())));
 }
