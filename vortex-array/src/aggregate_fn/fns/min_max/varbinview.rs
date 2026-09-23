@@ -49,18 +49,16 @@ fn compute_min_max_with_validity(
     }
 
     let dtype = array.dtype();
-    Ok(extrema.map(|extrema| MinMaxResult {
-        min: make_scalar(dtype, extrema.min_bytes),
-        max: make_scalar(dtype, extrema.max_bytes),
+    Ok(extrema.map(|Extrema { min, max }| MinMaxResult {
+        min: make_scalar(dtype, min.bytes(buffers)),
+        max: make_scalar(dtype, max.bytes(buffers)),
     }))
 }
 
-/// The running extrema of a scan, each as its [order prefix](BinaryView::order_prefix) plus bytes.
+/// The views of the smallest and largest values a scan has seen.
 struct Extrema<'a> {
-    min_prefix: u32,
-    min_bytes: &'a [u8],
-    max_prefix: u32,
-    max_bytes: &'a [u8],
+    min: &'a BinaryView,
+    max: &'a BinaryView,
 }
 
 /// Fold the fully-valid `views` into `extrema`, seeding it from the first view if empty.
@@ -71,29 +69,22 @@ struct Extrema<'a> {
 fn scan<'a>(
     extrema: Option<Extrema<'a>>,
     views: &'a [BinaryView],
-    buffers: &[&'a [u8]],
+    buffers: &[&[u8]],
 ) -> Option<Extrema<'a>> {
-    let (seed, rest) = match extrema {
+    let (Extrema { mut min, mut max }, rest) = match extrema {
         Some(extrema) => (extrema, views),
         None => {
             let (first, rest) = views.split_first()?;
-            let prefix = first.order_prefix();
-            let bytes = first.bytes(buffers);
             let seed = Extrema {
-                min_prefix: prefix,
-                min_bytes: bytes,
-                max_prefix: prefix,
-                max_bytes: bytes,
+                min: first,
+                max: first,
             };
             (seed, rest)
         }
     };
-    let Extrema {
-        mut min_prefix,
-        mut min_bytes,
-        mut max_prefix,
-        mut max_bytes,
-    } = seed;
+    let cmp = |a: &BinaryView, b: &BinaryView| a.value_cmp(buffers, b, buffers);
+    // Cached so the rejection test compares registers instead of reloading the extrema's views.
+    let (mut min_prefix, mut max_prefix) = (min.order_prefix(), max.order_prefix());
 
     let (pairs, remainder) = rest.as_chunks::<2>();
     for [a, b] in pairs {
@@ -106,45 +97,29 @@ fn scan<'a>(
             continue;
         }
 
-        let (a_bytes, b_bytes) = (a.bytes(buffers), b.bytes(buffers));
-        let ((lo_prefix, lo), (hi_prefix, hi)) =
-            if a_prefix < b_prefix || (a_prefix == b_prefix && a_bytes <= b_bytes) {
-                ((a_prefix, a_bytes), (b_prefix, b_bytes))
-            } else {
-                ((b_prefix, b_bytes), (a_prefix, a_bytes))
-            };
-        if lo_prefix < min_prefix || (lo_prefix == min_prefix && lo < min_bytes) {
-            min_prefix = lo_prefix;
-            min_bytes = lo;
+        let ((lo, lo_prefix), (hi, hi_prefix)) = if cmp(a, b).is_le() {
+            ((a, a_prefix), (b, b_prefix))
+        } else {
+            ((b, b_prefix), (a, a_prefix))
+        };
+        if cmp(lo, min).is_lt() {
+            (min, min_prefix) = (lo, lo_prefix);
         }
-        if hi_prefix > max_prefix || (hi_prefix == max_prefix && hi > max_bytes) {
-            max_prefix = hi_prefix;
-            max_bytes = hi;
+        if cmp(hi, max).is_gt() {
+            (max, max_prefix) = (hi, hi_prefix);
         }
     }
 
     // A value that lowers the minimum cannot also raise the maximum.
-    for view in remainder {
-        let prefix = view.order_prefix();
-        if prefix > min_prefix && prefix < max_prefix {
-            continue;
-        }
-        let bytes = view.bytes(buffers);
-        if prefix < min_prefix || (prefix == min_prefix && bytes < min_bytes) {
-            min_prefix = prefix;
-            min_bytes = bytes;
-        } else if prefix > max_prefix || (prefix == max_prefix && bytes > max_bytes) {
-            max_prefix = prefix;
-            max_bytes = bytes;
+    if let [view] = remainder {
+        if cmp(view, min).is_lt() {
+            min = view;
+        } else if cmp(view, max).is_gt() {
+            max = view;
         }
     }
 
-    Some(Extrema {
-        min_prefix,
-        min_bytes,
-        max_prefix,
-        max_bytes,
-    })
+    Some(Extrema { min, max })
 }
 
 fn make_scalar(dtype: &DType, value: &[u8]) -> Scalar {
