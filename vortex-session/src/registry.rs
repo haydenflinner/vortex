@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -12,16 +13,41 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
 
-use lasso::Spur;
-use lasso::ThreadedRodeo;
 use parking_lot::RwLock;
 use vortex_error::VortexExpect;
 use vortex_utils::aliases::DefaultHashBuilder;
 use vortex_utils::aliases::hash_set::HashSet;
 
 /// Global string interner for [`Id`] values.
-static INTERNER: LazyLock<ThreadedRodeo<Spur, DefaultHashBuilder>> =
-    LazyLock::new(|| ThreadedRodeo::with_hasher(DefaultHashBuilder::default()));
+///
+/// The interned strings are arena-leaked (as with the previous lasso
+/// interner), so resolved `&'static str`s are stable for the lifetime of
+/// the program.
+struct GlobalInterner {
+    strings: Vec<&'static str>,
+    by_str: HashMap<&'static str, u32, DefaultHashBuilder>,
+}
+
+static INTERNER: LazyLock<RwLock<GlobalInterner>> = LazyLock::new(|| {
+    RwLock::new(GlobalInterner {
+        strings: Vec::new(),
+        by_str: HashMap::with_hasher(DefaultHashBuilder::default()),
+    })
+});
+
+fn intern(s: &'static str) -> u32 {
+    if let Some(&idx) = INTERNER.read().by_str.get(s) {
+        return idx;
+    }
+    let mut interner = INTERNER.write();
+    if let Some(&idx) = interner.by_str.get(s) {
+        return idx;
+    }
+    let idx = u32::try_from(interner.strings.len()).vortex_expect("interner overflow");
+    interner.strings.push(s);
+    interner.by_str.insert(s, idx);
+    idx
+}
 
 /// A lightweight, copyable identifier backed by a global string interner.
 ///
@@ -29,25 +55,25 @@ static INTERNER: LazyLock<ThreadedRodeo<Spur, DefaultHashBuilder>> =
 /// globally-unique string identifiers throughout Vortex. Equality and hashing
 /// are O(1) symbol comparisons.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Id(Spur);
+pub struct Id(u32);
 
 impl Id {
     /// Intern a string and return its `Id`.
     pub fn new(s: &str) -> Self {
-        Self(INTERNER.get_or_intern(s))
+        if let Some(&idx) = INTERNER.read().by_str.get(s) {
+            return Self(idx);
+        }
+        Self(intern(Box::leak(s.to_string().into_boxed_str())))
     }
 
     /// Intern a string and return its `Id`.
     pub fn new_static(s: &'static str) -> Self {
-        Self(INTERNER.get_or_intern_static(s))
+        Self(intern(s))
     }
 
     /// Returns the interned string.
-    pub fn as_str(&self) -> &str {
-        let s = INTERNER.resolve(&self.0);
-        // SAFETY: INTERNER is 'static and its arena is append-only, so resolved string
-        // pointers are stable for the lifetime of the program.
-        unsafe { &*(s as *const str) }
+    pub fn as_str(&self) -> &'static str {
+        INTERNER.read().strings[self.0 as usize]
     }
 }
 

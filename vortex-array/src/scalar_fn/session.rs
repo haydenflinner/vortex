@@ -46,6 +46,17 @@ pub struct ScalarFnSession {
 }
 
 impl ScalarFnSession {
+    /// An empty registry: no built-in scalar functions registered.
+    ///
+    /// Sessions that only serialize/decode arrays (never evaluate
+    /// expressions) can start here so unregistered function kernels
+    /// dead-strip instead of linking through `Default`'s registrations.
+    pub fn empty() -> Self {
+        Self {
+            registry: ScalarFnRegistry::default(),
+        }
+    }
+
     pub fn registry(&self) -> &ScalarFnRegistry {
         &self.registry
     }
